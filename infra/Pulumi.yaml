@@ -1,0 +1,241 @@
+name: matrix
+runtime: yaml
+description: Matrix Synapse server
+
+# TODO: Figure out if we ned firewall setup for the filestore: https://cloud.google.com/filestore/docs/configuring-firewall
+
+resources:
+  namespace:
+    type: kubernetes:core/v1:Namespace
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}
+
+  database:
+    type: gcp:sql/database:Database
+    properties:
+      name: matrix-synapse
+      instance: ${database:instanceName}
+
+  databasePassword:
+    type: random:RandomPassword
+    properties:
+      length: 16
+      special: false
+
+  databaseUser:
+    type: gcp:sql/user:User
+    properties:
+      name: abax-minuba
+      instance: ${database:instanceName}
+      password: ${databasePassword.result}
+
+  serviceAccountIamMember:
+    type: gcp:serviceAccount:IAMMember
+    properties:
+      serviceAccountId: ${database:serviceAccountId}
+      role: roles/iam.workloadIdentityUser
+      member: serviceAccount:${gcp:project}.svc.id.goog[${namespace.metadata.name}/${serviceAccount.metadata.name}]
+
+  serviceAccount:
+    type: kubernetes:core/v1:ServiceAccount
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}
+        namespace: ${namespace.metadata.name}
+        annotations:
+          "iam.gke.io/gcp-service-account": ${database:serviceAccountEmail}
+
+  appSecret:
+    type: kubernetes:core/v1:Secret
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}-registration-secret
+        namespace: ${namespace.metadata.name}
+      data:
+        secrets.yaml:
+          registration-shared-secret: ${synapse:registrationSharedSecret}
+  service:
+    type: kubernetes:core/v1:Service
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}
+        namespace: ${namespace.metadata.name}
+      spec:
+        selector: ${appLabels}
+        ports:
+          - port: 8484
+            targetPort: 8448
+  ingress:
+    type: kubernetes:networking.k8s.io/v1:Ingress
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}
+        namespace: ${namespace.metadata.name}
+        annotations:
+          pulumi.com/skipAwait: "true"
+          kubernetes.io/ingress.class: "caddy"
+      spec:
+        rules:
+          - host: ${host}
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ${pulumi.project}-${pulumi.stack}
+                      port:
+                        number: 8484
+
+  homeserverConfig:
+    type: kubernetes:core/v1:ConfigMap
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}-homeserver-config
+        namespace: ${namespace.metadata.name}
+      data:
+        homeserver.yaml:
+          server_name: "bjerk.io"
+          listeners:
+            - port: 8448
+              type: http
+              tls: true
+              bind_addresses:
+                - "::1"
+                - "127.0.0.1"
+              resources:
+                - names: [client, federation]
+                  compress: false
+          public_baseurl: https://${host}
+          enable_registration: true
+          enable_registration_captcha: true
+          registration_requires_token: true
+          report_stats: true
+          media_store_path: "/synapse/media_store"
+          pid_file: "/synapse/data/homeserver.pid"
+          signing_key_path: "/synapse/data/bjerk.io.signing.key"
+          database:
+            name: postgres
+            args:
+              user: ${databaseUser.name}
+              dbname: ${databasePassword.result}
+              host: 127.0.0.1
+              cp_min: 5
+              cp_max: 10
+
+  # Create Kubernetes deployment for Matrix Synapse server
+  deployment:
+    type: kubernetes:apps/v1:Deployment
+    properties:
+      metadata:
+        name: "matrix-synapse"
+        namespace: ${namespace.metadata.name}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: matrix-synapse
+        template:
+          metadata:
+            labels:
+              app: matrix-synapse
+          spec:
+            nodeSelector:
+              "iam.gke.io/gke-metadata-server-enabled": "true"
+            containers:
+              - name: synapse
+                image: ${synapse:image}:${synapse:tag}
+                ports:
+                  - containerPort: 8448
+                volumeMounts:
+                  - name: config-volume
+                    mountPath: /config
+                  - name: data-volume
+                    mountPath: /data
+                  - name: secrets-volume
+                    mountPath: /secrets
+                command:
+                  - "/start.py"
+                  - run
+                  - "--config-path=/config/homeserver.yaml"
+                  - "--config-path=/secrets/secrets.yaml"
+
+              - name: cloud-sql-proxy
+                image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.8.0
+                args:
+                  - --structured-logs=true
+                  - --port=5432
+                  - ${database:connectionName}
+                securityContext:
+                  runAsNonRoot: true
+            volumes:
+              - name: config-volume
+                configMap:
+                  name: ${homeserverConfig.metadata.name}
+              - name: data-volume
+                persistentVolumeClaim:
+                  claimName: ${persistentVolumeClaim.metadata.name}
+              - name: secrets-volume
+                secret:
+                  secretName: ${appSecret.metadata.name}
+
+  gcpFilestoreInstance:
+    type: gcp:filestore:Instance
+    properties:
+      name: ${pulumi.project}-${pulumi.stack}-filestore
+      tier: STANDARD
+      project: ${google:projectId}
+      location: ${google:region}
+      networks:
+        - network: default
+          reservedIpRange: 10.0.0.0/29
+      fileShares:
+        name: ${pulumi.project}-${pulumi.stack}-matrix-storage
+        capacityGb: 1024
+
+  matrixSynapseStorageClass:
+    type: kubernetes:storage.k8s.io/v1:StorageClass
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}-sc
+        namespace: ${namespace.metadata.name}
+      provisioner: filestore.csi.storage.gke.io
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true
+      parameters:
+        tier: standard
+        network: default
+  persistentVolume:
+    type: kubernetes:core/v1:PersistentVolume
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}-pv
+        namespace: ${namespace.metadata.name}
+      spec:
+        capacity:
+          storage: 10Gi
+        accessModes:
+          - ReadWriteMany
+        persistentVolumeReclaimPolicy: Retain
+        volumeMode: Filesystem
+        storageClassName: ${matrixSynapseStorageClass.metadata.name}
+        csi:
+          driver: filestore.csi.storage.gke.io
+          volumeHandle: modeInstance/${gcpFilestoreInstance.properties.location}/${gcpFilestoreInstance.properties.name}${gcpFilestoreInstance.properties.fileShares.name}
+          volumeAttributes:
+            ip: ${gcpFilestoreInstance.properties.ipAddresses[0]}
+            volume: ${gcpFilestoreInstance.properties.fileShares.name}
+  persistentVolumeClaim:
+    type: kubernetes:core/v1:PersistentVolumeClaim
+    properties:
+      metadata:
+        name: ${pulumi.project}-${pulumi.stack}-pvc
+        namespace: ${namespace.metadata.name}
+      spec:
+        accessModes:
+          - ReadWriteMany
+        storageClassName: ${matrixSynapseStorageClass.metadata.name}
+        resources:
+          requests:
+            storage: 10Gi
